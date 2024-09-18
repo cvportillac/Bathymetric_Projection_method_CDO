@@ -1,0 +1,202 @@
+############################################################################################################################################
+# 1) Ver la estructura general del archivo netCDF descargado de de Marine Copernicus
+############################################################################################################################################
+cdo sinfon cmems_mod_glo_bgc_my_0.25deg_P1M_m.nc
+############################################################################################################################################
+
+
+############################################################################################################################################
+# 2) Determinar Promedios mensuales multianuales. 
+############################################################################################################################################
+
+cdo ymonmean cmems_mod_glo_bgc_my_0.25deg_P1M_m.nc promedio_mensual_multianual.nc
+# Ver los detalles generales de los promedios mensuales multianuales
+cdo sinfon promedio_mensual_multianual.nc
+############################################################################################################################################
+
+
+############################################################################################################################################
+# 3) Rellenar datos faltantes por profundidad oceanográfica del archivo netCDF de Marine copernicus. 
+############################################################################################################################################
+# Se aplica para asegurar una extracción completa de los datos en áreas sin datos.
+cdo fillmiss promedio_mensual_multianual.nc promedio_mensual_multianual_filled.nc
+############################################################################################################################################
+
+
+############################################################################################################################################
+# 4) Resample del netCDF de Marine copernicus y de la batimetría de GEBCO.
+############################################################################################################################################
+
+# 4A. Ver coordenadas (xfirst y yfirst) del extent del netCDF de Marine copernicus: promedio_mensual_multianual_filled.nc
+cdo sinfon promedio_mensual_multianual_filled.nc
+
+# 4B. Crear grilla para resample. Incluir las coordenadas xfirst y yfirst identificadas en el paso 4A.
+# 4B1. La resolución de interés es: 0.016666667°. Si se requiere cambiar la resolución, se deben actualizar los datos asociados a la resolución espacial.
+echo "gridtype  = lonlat" > gridfile_0.016666667.txt
+echo "xfirst    = -81" >> gridfile_0.016666667.txt
+echo "xsize     = 211" >> gridfile_0.016666667.txt  # (|-77.5 - (-81)| / 0.016666667) + 1 = 211
+echo "xinc      = 0.016666667" >> gridfile_0.016666667.txt
+echo "yfirst    = 1.25" >> gridfile_0.016666667.txt
+echo "ysize     = 106" >> gridfile_0.016666667.txt  # (|3 - 1.25| / 0.016666667) + 1 = 106
+echo "yinc      = 0.016666667" >> gridfile_0.016666667.txt
+
+# 4C. Aplicar resample mediante interpolación bilineal (2*2) o bicúbica (4*4). En este caso se usa la interpolación bicúbica.
+cdo remapbil,gridfile_0.016666667.txt promedio_mensual_multianual_filled.nc promedio_mensual_multianual_filled_remaped.nc
+
+# 4D. Remapear la batimetría con base al netCDF remapeado.
+cdo remapbil,promedio_mensual_multianual_filled_remaped.nc batimetria_gebco_2024.nc Batimetria_remaped.nc
+
+# 4E. Verificar si el extent de la batimetría remapeada es igual al del netCDF de Marine copernicus remapeado (ver coordenadas asociadas al extent geográfico).
+cdo sinfon promedio_mensual_multianual_filled_remaped.nc
+cdo sinfon Batimetria_remaped.nc
+
+# 4F. Si el extent no es igual, se debe descomentar (#) el comando cdo para ejecutarlo y recortar la batimetría al extent extacto del netCDF de Marine copernicus remapeado. 
+# Los valores de: xfirst y yfirst  se dejan tal cual estan en la grilla creada anteriormte (4B1), el resto se cambia según el netCDF de Marine copernicus remapeado.
+#cdo sellonlatbox,-81,-77.5,1.25,3 Batimetria_remaped.nc Batimetria_remaped_cropped.nc
+############################################################################################################################################
+
+
+############################################################################################################################################
+# 5) Preparar la batimetría asociada al fondo marino de interés.
+############################################################################################################################################
+
+# 5A. Filtrar la batimetría del fondo marino dejando por fuera los datos continentales con elevaciones mayores que cero.
+cdo setrtomiss,1,inf Batimetria_remaped.nc Batimetria_con_valores_negativos.nc
+
+# 5B. Convertir las profundidades negativa a valores positivos para acoplarnos a las profundidades que maneja Marine copernicus.
+cdo mulc,-1 Batimetria_con_valores_negativos.nc Batimetria_con_valores_positivos.nc
+############################################################################################################################################
+
+
+############################################################################################################################################
+# 6) Construir rangos batimétricos acorde a los niveles de profundidad del netCDF de Marine Copernicus.
+############################################################################################################################################
+
+# 6A. Ver los niveles de profundidad del netCDF de Marine copernicus.
+cdo showlevel promedio_mensual_multianual_filled_remaped.nc
+
+# 6B. Ejecutar script completo
+
+# Definir el archivo de batimetría de entrada
+input_batimetria="Batimetria_con_valores_positivos.nc"
+# Extraer los niveles de profundidad del archivo de entrada
+depths=$(cdo showlevel promedio_mensual_multianual_filled_remaped.nc)
+# Convertir los niveles de profundidad en un array
+IFS=' ' read -r -a levels <<< "$depths"
+# Iterar sobre los niveles de profundidad para generar las máscaras
+
+for i in "${!levels[@]}"; do
+    # Saltar el nivel si estamos en el último nivel
+    if [ $i -lt $((${#levels[@]} - 1)) ]; then
+        lower=${levels[$i]}
+        upper=${levels[$i+1]}
+
+        # No excluir niveles exactos como por ejemplo 120. Se añade ceros como decimales
+        lower=$(printf "%.6f" $lower)
+        upper=$(printf "%.6f" $upper)      
+
+        # Definir el nombre del archivo de salida de la máscara
+        output_mask="mask_batimetria_rango_${lower}_a_${upper}.nc"  
+
+        # Crear la máscara para el rango de profundidad usando setrtoc y setrtomiss
+        cdo -setrtoc,$lower,$upper,1 -setrtomiss,0,$lower -setrtomiss,$upper,inf $input_batimetria $output_mask        
+        echo "Máscara creada para el rango $lower a $upper: $output_mask"
+    fi
+done
+############################################################################################################################################
+
+
+############################################################################################################################################
+# 7) Extraer los valores de las variables oceanográficas asociadas a cada rango batimétrico construido en el paso 6B.
+############################################################################################################################################
+
+# 7A. Ejecutar script completo
+
+# Definir el archivo de entrada oceanográfico
+input_oceanografia="promedio_mensual_multianual_filled_remaped.nc"
+# Definir las variables oceanográficas a extraer
+variables=("chl" "no3" "nppv" "o2" "po4" "si")
+# Iterar sobre todas las máscaras generadas
+
+for mask in mask_batimetria_rango_*.nc; do
+    # Extraer el rango de la máscara desde el nombre del archivo
+    rango=$(echo $mask | grep -oP 'rango_\K[0-9.]+_a_[0-9.]+')
+
+    # Dividir el rango en nivel_min y nivel_max, asegurando que el formato sea correcto
+    nivel_min=$(echo $rango | cut -d'_' -f1)
+    nivel_max=$(echo $rango | cut -d'_' -f3)
+
+    # Asegurarnos de que sean números válidos en formato flotante
+    nivel_min=$(printf "%.6f" $nivel_min)
+    nivel_max=$(printf "%.6f" $nivel_max)
+
+    # No excluir el nivel 120 en el proceso
+    echo "Procesando rango de $nivel_min a $nivel_max"
+
+    # Iterar sobre cada variable oceanográfica
+    for var in "${variables[@]}"; do
+        # Definir el archivo de salida de la variable por rango
+        output_file="output_oceanografia_rango_${var}_${nivel_min}_a_${nivel_max}.nc"        
+        # Asegúrate de que exista la variable en el archivo antes de intentar extraerla
+
+        if cdo showvar $input_oceanografia | grep -q $var; then
+            # Extraer la variable usando la máscara y seleccionar solo la profundidad correspondiente
+            cdo ifthen $mask -selname,$var -sellevel,$nivel_min,$nivel_max $input_oceanografia $output_file            
+            echo "Variable $var extraída para el rango ${nivel_min} a ${nivel_max} con profundidad seleccionada: $output_file"
+        else
+
+            echo "La variable $var no existe en $input_oceanografia, omitiendo..."
+        fi
+    done
+done
+echo "Proceso completado para todas las variables."
+############################################################################################################################################
+
+
+############################################################################################################################################
+# 8) Unir la extracción de datos para cada variable oceanográfica de interés.
+############################################################################################################################################
+
+# 8A. Ejecutar script completo
+
+# Definir las variables a procesar
+variables=("chl" "no3" "nppv" "o2" "po4" "si")
+
+# Iterar sobre cada variable
+for var in "${variables[@]}"; do
+    echo "Procesando variable: $var"
+
+    # Dado que se extrajeron areas con diferente ubicación geográfica. El comando enssum integra todas las capas en una sola por variable
+    cdo enssum output_oceanografia_rango_${var}_*.nc temp_${var}.nc  
+
+    # Eliminar la dimensión de profundidad
+    cdo sellevidx,1 temp_${var}.nc Ectract_variables_${var}.nc
+
+    # Limpiar archivo temporal
+    rm temp_${var}.nc
+    echo "Variable $var procesada y guardada en Ectract_variables_${var}.nc"
+done
+
+echo "Proceso completado para todas las variables."
+#Comando para combinar todas las variables en un solo archivo:
+cdo merge Ectract_variables_*.nc Ectract_variables_unido.nc
+############################################################################################################################################
+
+
+############################################################################################################################################
+# 9) Completar posibles datos faltantes y extraer por máscara los datos asociados al área netamente de interés.
+############################################################################################################################################
+
+
+# 9A. Crear mascara para realizar la primera extracción 
+cdo setrtomiss,300.000001,inf Batimetria_con_valores_positivos.nc Batimetria_0_300m.nc
+
+# 9B. Completar los posibles datos faltantes. Se completa para todo el extent para luego hacer recortes homogéneos para el área de interés.
+cdo fillmiss Ectract_variables_unido.nc Ectract_variables_unido_filled_extent.nc
+
+# 9C. El comando 'ifthen' aplicará la máscara base y mantendrá solo los datos en las celdas donde la máscara tenga valores
+cdo ifthenelse Batimetria_0_300m.nc Ectract_variables_unido_filled_extent.nc Ectract_variables_unido_filled_extent.nc Ectract_variables_unido_filled_area_inicial.nc
+
+# 9D. Cortar el netCDF final al área de interés según las coordenadas
+cdo sellonlatbox,-79.237500,-77.708185,1.400888,2.845833 Ectract_variables_unido_filled_area_inicial.nc Ectract_variables_unido_filled_area_final.nc
+############################################################################################################################################
